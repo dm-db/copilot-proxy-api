@@ -114,6 +114,87 @@ describe("requestLogMiddleware", () => {
 })
 
 describe("requestLogMiddleware hardening", () => {
+  test.each(["response.failed", "response.incomplete"])(
+    "logs %s even when the upstream HTTP status is 200",
+    async (type) => {
+      const logs: Array<string> = []
+      const app = new Hono()
+      app.use(createRequestLogMiddleware((line) => logs.push(line)))
+      const body = `data: ${JSON.stringify({
+        type,
+        response: {
+          error: { code: "invalid_request_body", message: "PRIVATE_CONTENT" },
+          incomplete_details: { reason: "max_output_tokens" },
+        },
+      })}\n\n`
+      app.get(
+        "/v1/responses",
+        () =>
+          new Response(body, {
+            headers: { "content-type": "text/event-stream" },
+          }),
+      )
+
+      const response = await app.request("/v1/responses")
+      expect(await response.text()).toBe(body)
+      expect(logs).toHaveLength(1)
+      const line = stripAnsi(logs[0] ?? "")
+      expect(line).toContain(type)
+      expect(line).toContain(
+        type === "response.failed" ?
+          "invalid_request_body"
+        : "max_output_tokens",
+      )
+      expect(line).not.toContain("PRIVATE_CONTENT")
+    },
+  )
+
+  test("logs a Responses stream that closes before a terminal event", async () => {
+    const logs: Array<string> = []
+    const app = new Hono()
+    app.use(createRequestLogMiddleware((line) => logs.push(line)))
+    const body = 'data: {"type":"response.created"}\n\n'
+    app.get(
+      "/v1/responses",
+      () =>
+        new Response(body, {
+          headers: { "content-type": "text/event-stream" },
+        }),
+    )
+
+    expect(await (await app.request("/v1/responses")).text()).toBe(body)
+    expect(stripAnsi(logs[0] ?? "")).toContain(
+      "Responses stream closed before a terminal event",
+    )
+  })
+
+  test("does not report completed Responses or other SSE routes as truncated", async () => {
+    const logs: Array<string> = []
+    const app = new Hono()
+    app.use(createRequestLogMiddleware((line) => logs.push(line)))
+    app.get(
+      "/v1/responses",
+      () =>
+        new Response('data: {"type":"response.completed"}\n\n', {
+          headers: { "content-type": "text/event-stream" },
+        }),
+    )
+    app.get(
+      "/v1/messages",
+      () =>
+        new Response('data: {"type":"message_stop"}\n\n', {
+          headers: { "content-type": "text/event-stream" },
+        }),
+    )
+
+    await (await app.request("/v1/responses")).text()
+    await (await app.request("/v1/messages")).text()
+    expect(logs).toHaveLength(2)
+    for (const line of logs) {
+      expect(stripAnsi(line)).not.toContain("closed before")
+    }
+  })
+
   test("logs requests whose response body is never read", async () => {
     const logs: Array<string> = []
     const app = new Hono()

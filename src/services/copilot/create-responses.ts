@@ -7,6 +7,7 @@ import type {
 } from "~/routes/responses/types"
 
 import { copilotBaseUrl, copilotHeaders } from "~/lib/api-config"
+import { wrapCancellableResponse } from "~/lib/cancellable-response"
 import { copilotFetch } from "~/lib/copilot-fetch"
 import { HTTPError } from "~/lib/error"
 import {
@@ -17,11 +18,12 @@ import { state } from "~/lib/state"
 import {
   createEncryptedOutputScope,
   isEncryptedOutputError,
-  isImmediateEncryptedOutputStreamFailure,
+  inspectResponsesStreamFailure,
   isRejectedEncryptedOutput,
   rememberRejectedEncryptedOutputs,
   stripEncryptedOutputParts,
 } from "~/services/copilot/encrypted-output-recovery"
+import { validateResponsesCapabilities } from "~/services/copilot/responses-capabilities"
 
 /**
  * Hard transport ceiling. Azure Front Door rejects bodies above ~5.4 MB before
@@ -70,8 +72,16 @@ const PRESERVED_INPUT_STRING_KEYS = new Set([
 
 export async function createResponses(
   payload: ResponsesApiRequest,
+  signal?: AbortSignal,
 ): Promise<Response> {
   if (!state.copilotToken) throw new Error("Copilot token not found")
+  validateResponsesCapabilities(payload)
+  const cancellation = new AbortController()
+  const upstreamSignal =
+    signal ?
+      AbortSignal.any([signal, cancellation.signal])
+    : cancellation.signal
+  upstreamSignal.throwIfAborted()
 
   const url = `${copilotBaseUrl(state)}/responses`
   const encryptedOutputScope = createEncryptedOutputScope(
@@ -100,7 +110,7 @@ export async function createResponses(
   )
 
   const result = await fetchResponsesWithEncryptedOutputFallback(
-    { url, headers, encryptedOutputScope },
+    { url, headers, encryptedOutputScope, signal: upstreamSignal },
     upstreamPayload,
   )
   const { response } = result
@@ -139,6 +149,7 @@ export async function createResponses(
             type: "error",
             error: {
               type: "invalid_request_error",
+              code: "context_length_exceeded",
               message: `prompt is too long: input length and \`max_tokens\` exceed context limit: ${estimatedTokens} + ${maxOutputTokens} > ${modelLimit} tokens`,
               // Preserve what upstream actually said, so a client that wants
               // to diagnose rather than just compact is not flying blind.
@@ -164,7 +175,7 @@ export async function createResponses(
     )
   }
 
-  return response
+  return wrapCancellableResponse(response, cancellation)
 }
 
 interface ResponsesFetchResult {
@@ -174,6 +185,7 @@ interface ResponsesFetchResult {
 }
 
 interface ResponsesFetchContext {
+  signal: AbortSignal
   encryptedOutputScope: string
   headers: Record<string, string>
   url: string
@@ -183,13 +195,13 @@ async function fetchResponsesWithEncryptedOutputFallback(
   context: ResponsesFetchContext,
   payload: ResponsesApiRequest,
 ): Promise<ResponsesFetchResult> {
-  const { encryptedOutputScope, headers, url } = context
+  const { encryptedOutputScope, signal } = context
   const fallback = stripEncryptedOutputParts(payload)
-  const initial = await sendResponsesRequest(url, headers, payload)
-  if (fallback.count === 0) return initial
+  const initial = await sendResponsesRequest(context, payload)
 
   if (
-    !initial.response.ok
+    fallback.count > 0
+    && !initial.response.ok
     && initial.errorBody
     && isEncryptedOutputError(initial.response, initial.errorBody)
   ) {
@@ -200,15 +212,32 @@ async function fetchResponsesWithEncryptedOutputFallback(
       encryptedOutputScope,
       fallback.fingerprints,
     )
-    return sendResponsesRequest(url, headers, fallback.payload)
+    return fetchResponsesWithEncryptedOutputFallback(context, fallback.payload)
   }
 
+  if (!initial.response.ok || !payload.stream) return initial
+  const inspected = await inspectResponsesStreamFailure(
+    initial.response,
+    signal,
+  )
+  initial.response = inspected.response
   if (
-    initial.response.ok
-    && payload.stream
-    && (await isImmediateEncryptedOutputStreamFailure(initial.response))
+    inspected.errorBody
+    && isContextOverflow(
+      new Response(null, { status: 400 }),
+      inspected.errorBody,
+      0,
+    )
   ) {
-    void initial.response.body?.cancel().catch(() => undefined)
+    void inspected.response.body?.cancel().catch(() => undefined)
+    return {
+      ...initial,
+      errorBody: inspected.errorBody,
+      response: new Response(inspected.errorBody, { status: 400 }),
+    }
+  }
+  if (inspected.failed && fallback.count > 0) {
+    void inspected.response.body?.cancel().catch(() => undefined)
     consola.warn(
       `Copilot stream failed before output; retrying without ${fallback.count} encrypted output part(s)`,
     )
@@ -216,19 +245,24 @@ async function fetchResponsesWithEncryptedOutputFallback(
       encryptedOutputScope,
       fallback.fingerprints,
     )
-    return sendResponsesRequest(url, headers, fallback.payload)
+    return fetchResponsesWithEncryptedOutputFallback(context, fallback.payload)
   }
 
   return initial
 }
 
 async function sendResponsesRequest(
-  url: string,
-  headers: Record<string, string>,
+  context: ResponsesFetchContext,
   payload: ResponsesApiRequest,
 ): Promise<ResponsesFetchResult> {
+  const { url, headers, signal } = context
   const body = JSON.stringify(payload)
-  const response = await copilotFetch(url, { method: "POST", headers, body })
+  const response = await copilotFetch(url, {
+    method: "POST",
+    headers,
+    body,
+    signal,
+  })
   const errorBody = response.ok ? undefined : await response.text()
   return { body, errorBody, response }
 }
@@ -780,8 +814,8 @@ function sanitizeResponsesPayload(
   delete (sanitized as ResponsesApiRequest & { service_tier?: unknown })
     .service_tier
 
-  if (sanitized.model === "gpt-6-astra") {
-    sanitized = sanitizeGpt6AstraPayload(sanitized)
+  if (requiresGpt6ResponsesSanitization(sanitized.model)) {
+    sanitized = sanitizeGpt6Payload(sanitized)
   }
 
   if (!sanitized.tools?.some((tool) => tool.type === "image_generation")) {
@@ -794,7 +828,11 @@ function sanitizeResponsesPayload(
   }
 }
 
-function sanitizeGpt6AstraPayload(
+function requiresGpt6ResponsesSanitization(modelId: string): boolean {
+  return modelId === "gpt-6-astra" || modelId === "gpt-6.1-sol"
+}
+
+function sanitizeGpt6Payload(
   payload: ResponsesApiRequest,
 ): ResponsesApiRequest {
   const sanitized = { ...payload }

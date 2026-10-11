@@ -35,6 +35,7 @@
     "release": "bun run verify && bumpp && bun publish --access public",
     "start": "NODE_ENV=production bun run ./src/main.ts",
     "test": "bun test tests/",
+    "test:codex": "bun run scripts/codex-smoke.ts",
     "typecheck": "tsc",
     "verify": "bun run typecheck && bun run lint && bun test tests/"
   },

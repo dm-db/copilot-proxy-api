@@ -22,5 +22,5 @@ export async function handleResponses(c: Context): Promise<Response> {
 
   if (state.manualApprove) await awaitApproval()
 
-  return createResponses(request)
+  return createResponses(request, c.req.raw.signal)
 }

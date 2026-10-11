@@ -75,8 +75,8 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   await setupCopilotToken()
   await cacheModels()
 
-  consola.debug(
-    `Available models: \n${state.models?.data.map((model) => `- ${model.id}`).join("\n")}`,
+  consola.info(
+    `Available models (${state.models?.data.length ?? 0}):\n${state.models?.data.map((model) => `- ${model.id}`).join("\n") ?? "None"}`,
   )
 
   const serverUrl = `http://localhost:${options.port}`

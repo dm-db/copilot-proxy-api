@@ -46,6 +46,22 @@ function cacheTestModels(): void {
 }
 
 describe("models route", () => {
+  test("generates Codex limits and effort from the selected Copilot model", async () => {
+    cacheTestModels()
+    const model = state.models?.data[0]
+    if (!model) throw new Error("Expected model")
+    model.capabilities.limits = {
+      max_context_window_tokens: 400000,
+      max_prompt_tokens: 272000,
+    }
+    const response = await createApp().request(
+      "/v1/models/gpt-5.5/codex-config",
+    )
+    const config = await response.text()
+    expect(config).toContain("model_context_window = 400000")
+    expect(config).toContain("model_auto_compact_token_limit = 244800")
+    expect(config).toContain('model_reasoning_effort = "high"')
+  })
   test("preserves Codex bundled metadata for catalog refreshes", async () => {
     cacheTestModels()
 

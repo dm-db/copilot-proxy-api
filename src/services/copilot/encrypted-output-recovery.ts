@@ -1,4 +1,3 @@
-import consola from "consola"
 import { createHash } from "node:crypto"
 
 import type {
@@ -10,9 +9,7 @@ const ENCRYPTED_OUTPUT_ERROR =
   "Encrypted function output content could not be decrypted or decoded."
 const MAX_REJECTED_ENCRYPTED_OUTPUTS = 256
 const REJECTED_ENCRYPTED_OUTPUT_TTL_MS = 30 * 60 * 1000
-const STREAM_FAILURE_INSPECTION_TIMEOUT_MS = 100
 const MAX_STREAM_FAILURE_INSPECTION_BYTES = 64 * 1024
-const MAX_STREAM_FAILURE_INSPECTION_EVENTS = 8
 const rejectedEncryptedOutputs = new Map<string, number>()
 
 export function createEncryptedOutputScope(
@@ -30,26 +27,44 @@ export function isEncryptedOutputError(
   return response.status === 400 && errorBody.includes(ENCRYPTED_OUTPUT_ERROR)
 }
 
-export async function isImmediateEncryptedOutputStreamFailure(
+export async function inspectResponsesStreamFailure(
   response: Response,
-): Promise<boolean> {
-  if (!response.body) return false
+  signal?: AbortSignal,
+): Promise<{ failed: boolean; response: Response; errorBody?: string }> {
+  signal?.throwIfAborted()
+  if (!response.body) return { failed: false, response }
   if (!response.headers.get("content-type")?.includes("text/event-stream")) {
-    return false
+    return { failed: false, response }
   }
 
-  const reader = response.clone().body?.getReader()
-  if (!reader) return false
+  // Bun's clone/body buffering can consume the original stream reader. Tee
+  // explicitly and forward the untouched branch rather than reading a clone.
+  const [inspection, forwarded] = (
+    response.body as ReadableStream<Uint8Array>
+  ).tee()
+  const reader = inspection.getReader()
+  const replay = new Response(forwarded, response)
+  const abort = () => {
+    void reader.cancel(signal?.reason).catch(() => undefined)
+    void forwarded.cancel(signal?.reason).catch(() => undefined)
+  }
+  signal?.addEventListener("abort", abort, { once: true })
 
   try {
-    return await readImmediateEncryptedOutputStreamFailure(reader)
+    const errorBody = await readImmediateEncryptedOutputStreamFailure(reader)
+    signal?.throwIfAborted()
+    return {
+      failed: errorBody?.includes(ENCRYPTED_OUTPUT_ERROR) ?? false,
+      errorBody,
+      response: replay,
+    }
   } catch (error) {
-    consola.debug("Failed to inspect Copilot Responses stream:", error)
+    void forwarded.cancel(error).catch(() => undefined)
+    throw error
   } finally {
+    signal?.removeEventListener("abort", abort)
     void reader.cancel().catch(() => undefined)
   }
-
-  return false
 }
 
 export function stripEncryptedOutputParts(
@@ -134,26 +149,20 @@ export function rememberRejectedEncryptedOutputs(
   }
 }
 
-async function readImmediateEncryptedOutputStreamFailure(
-  reader: Pick<ReadableStreamDefaultReader<Uint8Array>, "read">,
-): Promise<boolean> {
+async function readImmediateEncryptedOutputStreamFailure(reader: {
+  read(): Promise<{ done: boolean; value?: Uint8Array }>
+}): Promise<string | undefined> {
   const decoder = new TextDecoder()
-  const deadline = performance.now() + STREAM_FAILURE_INSPECTION_TIMEOUT_MS
   let buffer = ""
   let bytesRead = 0
-  let eventsRead = 0
 
   while (true) {
-    const remainingMs = deadline - performance.now()
-    if (remainingMs <= 0) return false
-
-    const result = await readStreamChunkWithTimeout(reader, remainingMs)
-    if (!result) return false
+    const result = await reader.read()
 
     const { done, value } = result
     if (value) {
       bytesRead += value.byteLength
-      if (bytesRead > MAX_STREAM_FAILURE_INSPECTION_BYTES) return false
+      if (bytesRead > MAX_STREAM_FAILURE_INSPECTION_BYTES) return undefined
       buffer += decoder.decode(value, { stream: !done })
     } else if (done) {
       buffer += decoder.decode()
@@ -166,29 +175,16 @@ async function readImmediateEncryptedOutputStreamFailure(
       const event = parseResponseEvent(next.block)
       if (!event) continue
 
-      eventsRead++
-      if (isEncryptedOutputFailureEvent(event)) return true
-      if (!isProvisionalResponseEvent(event)) return false
-      if (eventsRead >= MAX_STREAM_FAILURE_INSPECTION_EVENTS) return false
+      const failure = recoverableFailure(event)
+      if (failure) return failure
+      if (!isProvisionalResponseEvent(event)) return undefined
     }
 
     if (done) {
       const event = parseResponseEvent(buffer)
-      return event ? isEncryptedOutputFailureEvent(event) : false
+      return event ? recoverableFailure(event) : undefined
     }
   }
-}
-
-async function readStreamChunkWithTimeout(
-  reader: Pick<ReadableStreamDefaultReader<Uint8Array>, "read">,
-  timeoutMs: number,
-): Promise<{ done: boolean; value?: Uint8Array } | undefined> {
-  return await Promise.race([
-    reader.read(),
-    new Promise<undefined>((resolve) => {
-      setTimeout(resolve, timeoutMs)
-    }),
-  ])
 }
 
 function takeNextSseBlock(
@@ -226,16 +222,29 @@ function parseResponseEvent(block: string): ResponseStreamEvent | undefined {
   }
 }
 
-function isEncryptedOutputFailureEvent(event: ResponseStreamEvent): boolean {
-  return (
-    event.type === "response.failed"
-    && JSON.stringify(event).includes(ENCRYPTED_OUTPUT_ERROR)
-  )
+function recoverableFailure(event: ResponseStreamEvent): string | undefined {
+  if (event.type !== "response.failed" && event.type !== "error")
+    return undefined
+  const body = JSON.stringify(event)
+  if (
+    body.includes(ENCRYPTED_OUTPUT_ERROR)
+    || /context_length_exceeded|model_max_prompt_tokens_exceeded|maximum context length|prompt is too long/i.test(
+      body,
+    )
+  ) {
+    return body
+  }
+  return undefined
 }
 
 function isProvisionalResponseEvent(event: ResponseStreamEvent): boolean {
   return (
-    event.type === "response.created" || event.type === "response.in_progress"
+    event.type === "response.created"
+    || event.type === "response.in_progress"
+    || (event.type === "response.failed"
+      && typeof event.response === "object"
+      && event.response !== null
+      && !(event.response as Record<string, unknown>).error)
   )
 }
 

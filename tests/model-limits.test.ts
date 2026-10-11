@@ -39,6 +39,23 @@ describe("model limit helpers", () => {
     )
   })
 
+  test("uses 1m fallbacks for GPT-6.1 Sol", () => {
+    expect(getModelPromptLimit("gpt-6.1-sol")).toBe(ONE_M_PROMPT_TOKENS)
+    expect(getModelContextLimit("gpt-6.1-sol")).toBe(ONE_M_CONTEXT_TOKENS)
+  })
+
+  test("uses 1m GPT-6.1 Sol limits before smaller metadata", () => {
+    const limits = {
+      max_context_window_tokens: 272_000,
+      max_prompt_tokens: 272_000,
+    }
+
+    expect(getModelPromptLimit("gpt-6.1-sol", limits)).toBe(ONE_M_PROMPT_TOKENS)
+    expect(getModelContextLimit("gpt-6.1-sol", limits)).toBe(
+      ONE_M_CONTEXT_TOKENS,
+    )
+  })
+
   test("uses default prompt limit for non-1m models without metadata", () => {
     expect(getModelPromptLimit("claude-opus-4.7")).toBe(DEFAULT_PROMPT_TOKENS)
   })

@@ -23,6 +23,7 @@ interface RequestLogMetadata {
 
 interface RequestLogState extends RequestLogMetadata {
   cachedTokens?: number
+  error?: string
   finished: boolean
   inputTokens?: number
   outputTokens?: number
@@ -121,14 +122,18 @@ export function createRequestLogMiddleware(
       return
     }
 
-    const observer = new ResponseMetricsObserver(requestState, contentType)
+    const observer = new ResponseMetricsObserver(
+      requestState,
+      contentType,
+      c.req.path === "/v1/responses",
+    )
     const reader = (response.body as ReadableStream<Uint8Array>).getReader()
     const observedBody = new ReadableStream<Uint8Array>({
       async pull(controller) {
         try {
           const result = await reader.read()
           if (result.done) {
-            observer.finish()
+            observer.finish(true)
             finishRequestLog({
               c,
               requestState,
@@ -243,13 +248,20 @@ class ResponseMetricsObserver {
   private readonly decoder = new TextDecoder()
   private readonly isEventStream: boolean
   private readonly requestState: RequestLogState
+  private readonly trackResponsesCompletion: boolean
+  private hasTerminalResponseEvent = false
   private jsonBody = ""
   private sseBuffer = ""
   private skippingOversizedLine = false
 
-  constructor(requestState: RequestLogState, contentType: string) {
+  constructor(
+    requestState: RequestLogState,
+    contentType: string,
+    trackResponsesCompletion = false,
+  ) {
     this.requestState = requestState
     this.isEventStream = contentType.includes("text/event-stream")
+    this.trackResponsesCompletion = trackResponsesCompletion
   }
 
   push(chunk: Uint8Array): void {
@@ -277,10 +289,19 @@ class ResponseMetricsObserver {
     if (remaining > 0) this.jsonBody += text.slice(0, remaining)
   }
 
-  finish(): void {
+  finish(streamClosed = false): void {
     const finalText = this.decoder.decode()
     if (this.isEventStream) {
       this.pushSSEText(finalText + "\n")
+      if (
+        streamClosed
+        && this.trackResponsesCompletion
+        && !this.hasTerminalResponseEvent
+        && !this.requestState.error
+      ) {
+        this.requestState.error =
+          "Responses stream closed before a terminal event"
+      }
       return
     }
 
@@ -328,10 +349,43 @@ class ResponseMetricsObserver {
     if (!data || data === "[DONE]" || data.length > MAX_SSE_LINE_CHARS) return
 
     try {
-      mergeResponseMetrics(this.requestState, JSON.parse(data) as unknown)
+      const event = JSON.parse(data) as unknown
+      mergeResponseMetrics(this.requestState, event)
+      if (this.trackResponsesCompletion) this.observeResponseEvent(event)
     } catch {
       // Ignore malformed or non-JSON SSE data while preserving the stream.
     }
+  }
+
+  private observeResponseEvent(event: unknown): void {
+    if (!isRecord(event)) return
+    if (event.type === "response.completed") {
+      this.hasTerminalResponseEvent = true
+      return
+    }
+    if (
+      event.type !== "response.failed"
+      && event.type !== "response.incomplete"
+      && event.type !== "error"
+    ) {
+      return
+    }
+
+    this.hasTerminalResponseEvent = true
+    const response = isRecord(event.response) ? event.response : undefined
+    let detail: unknown = response?.error ?? event.error ?? event
+    let key = "code"
+    if (event.type === "response.incomplete") {
+      detail = response?.incomplete_details
+      key = "reason"
+    }
+    const code = isRecord(detail) ? detail[key] : undefined
+    // Keep diagnostic codes, never model output or upstream error messages.
+    const safeCode =
+      typeof code === "string" && /^[\w.-]{1,128}$/.test(code) ?
+        ` (${code})`
+      : ""
+    this.requestState.error = `Copilot ${event.type}${safeCode}`
   }
 }
 
@@ -406,7 +460,7 @@ function finishRequestLog(options: FinishRequestLogOptions): void {
         cachedTokens: requestState.cachedTokens,
         contextLimit,
         durationMs: endedAtMs - requestState.startedAtMs,
-        error,
+        error: error ?? requestState.error,
       }),
     )
   } catch (logError) {

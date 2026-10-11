@@ -1,10 +1,38 @@
 import { Hono } from "hono"
 
 import { forwardError } from "~/lib/error"
+import { getModelContextLimit, getModelPromptLimit } from "~/lib/model-limits"
 import { state } from "~/lib/state"
 import { cacheModels } from "~/lib/utils"
 
 export const modelRoutes = new Hono()
+
+modelRoutes.get("/:id/codex-config", (c) => {
+  const model = state.models?.data.find((item) => item.id === c.req.param("id"))
+  if (!model) return c.json({ error: { message: "Model not found" } }, 404)
+  if (
+    model.supported_endpoints
+    && !model.supported_endpoints.includes("/responses")
+  ) {
+    return c.json(
+      { error: { message: "Model does not support Responses" } },
+      400,
+    )
+  }
+  const context = getModelContextLimit(model.id, model.capabilities.limits)
+  const prompt = getModelPromptLimit(model.id, model.capabilities.limits)
+  const efforts = model.capabilities.supports.reasoning_effort
+  const effort = efforts?.includes("high") ? "high" : efforts?.[0]
+  const settings = [
+    `model = ${JSON.stringify(model.id)}`,
+    'model_provider = "copilot_proxy"',
+    `model_context_window = ${context}`,
+    `model_auto_compact_token_limit = ${Math.floor(Math.min(context, prompt) * 0.9)}`,
+  ]
+  if (effort)
+    settings.push(`model_reasoning_effort = ${JSON.stringify(effort)}`)
+  return c.text(settings.join("\n") + "\n")
+})
 
 modelRoutes.get("/", async (c) => {
   try {
@@ -29,6 +57,7 @@ modelRoutes.get("/", async (c) => {
       owned_by: model.vendor,
       display_name: model.name,
       capabilities: model.capabilities,
+      supported_endpoints: model.supported_endpoints,
       supported_capabilities: inferClaudeCodeCapabilities(model),
     }))
 

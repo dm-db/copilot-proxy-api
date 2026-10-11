@@ -391,9 +391,11 @@ This proxy supports the [OpenAI Codex CLI](https://github.com/openai/codex) thro
 Add the following to your `~/.codex/config.toml`:
 
 ```toml
-model = "gpt-6-astra"
+model = "gpt-6.1-sol"
 model_provider = "copilot_proxy"
 model_reasoning_effort = "high"
+model_context_window = 1000000
+model_auto_compact_token_limit = 842400
 
 [model_providers.copilot_proxy]
 name = "GitHub Copilot via copilot-proxy-api"
@@ -445,11 +447,32 @@ codex -c model_provider='"openai"'
 
 ### Notes
 
-- GPT-6 Astra uses the Responses API; before forwarding, the proxy removes Astra-incompatible sampling and logprob fields: `temperature`, `top_p`, `top_logprobs`, `logprobs`, and `message.output_text.logprobs` from `include`.
+- GPT-6 Astra and GPT-6.1 Sol use the Responses API; before forwarding, the proxy removes their incompatible sampling and logprob fields: `temperature`, `top_p`, `top_logprobs`, `logprobs`, and `message.output_text.logprobs` from `include`.
 - `service_tier` is ChatGPT-plan-specific. Codex may send it, but Copilot's Responses API rejects it, so the proxy strips it before forwarding.
-- `model_reasoning_effort = "high"` is passed through verbatim in the Responses request. The proxy does not validate it against the model's advertised effort levels.
+- Reasoning effort is checked against Copilot's advertised levels when available. Unsupported values return a 400 `unsupported_parameter` error; unknown capabilities are forwarded unchanged.
 - Codex model-catalog refreshes keep Codex's bundled metadata and instructions. Requests with Codex's `client_version` query receive its native empty-catalog shape; ordinary `GET /v1/models` requests still return the full OpenAI-compatible model list.
 - Very large sessions are trimmed before forwarding (oldest input dropped, images replaced with placeholders) to stay under Copilot's payload ceiling. The proxy logs a warning when this happens.
+
+### Model-specific settings and reliability
+
+Retrieve settings for your selected model with `GET /v1/models/<model-id>/codex-config`.
+For example:
+
+```sh
+curl http://localhost:4141/v1/models/gpt-6.1-sol/codex-config
+```
+
+Copy the returned top-level settings into `~/.codex/config.toml` alongside the provider configuration above. The compaction threshold reserves 10% below the smaller of the model's prompt and context limits. Recheck these settings when switching models. Ordinary model-list responses also advertise `supported_endpoints`.
+
+The proxy inspects bounded provisional stream data until model output starts, including delayed decrypt errors. It retries rejected encrypted tool-output parts using readable text, preserves reasoning ciphertext, and never replays a request after model output starts. Client cancellation aborts upstream fetches and retry waits. Context overflows received over HTTP or before streaming output return the OpenAI `context_length_exceeded` code. Codex requests receive a typed `response.failed` stream event so Codex recognizes the overflow; other clients retain the HTTP 400 response.
+
+To exercise the current checkout with a real Codex CLI, start an authenticated proxy, then run:
+
+```sh
+bun run test:codex
+```
+
+This checks text, shell tool calls/results, resumed history, images, and HTTP cancellation using an isolated temporary Codex configuration. It makes real Copilot requests. Override the source proxy with `COPILOT_PROXY_URL` or the model with `CODEX_SMOKE_MODEL`; for business/enterprise accounts set `COPILOT_ACCOUNT_TYPE` accordingly.
 
 ## Running from Source
 

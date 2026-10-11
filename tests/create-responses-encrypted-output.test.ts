@@ -294,6 +294,65 @@ test("does not retry or cache unrelated immediate stream failures", async () => 
   expect(nextBody).toContain("valid-generic-failure-ciphertext")
 })
 
+test("recovers a failed stream whose decrypt error arrives in a separate event", async () => {
+  const payload = {
+    model: "gpt-6.1-sol",
+    stream: true,
+    input: [
+      {
+        type: "agent_message",
+        content: [
+          { type: "input_text", text: "Readable tool output" },
+          {
+            type: "encrypted_content",
+            encrypted_content: "separate-event-stale-ciphertext",
+          },
+        ],
+      },
+    ],
+  } as ResponsesApiRequest
+  const fetchMock = mock((_url: string, opts: RequestInit) => {
+    const stale = bodyToString(opts.body).includes(
+      "separate-event-stale-ciphertext",
+    )
+    const events =
+      stale ?
+        [
+          { type: "response.created" },
+          {
+            type: "response.failed",
+            response: { status: "failed", error: null },
+          },
+          {
+            type: "error",
+            code: "invalid_request_body",
+            message:
+              "Encrypted function output content could not be decrypted or decoded.",
+          },
+        ]
+      : [
+          { type: "response.output_text.delta", delta: "Recovered" },
+          { type: "response.completed", response: { status: "completed" } },
+        ]
+    return new Response(
+      events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+      {
+        headers: { "content-type": "text/event-stream" },
+      },
+    )
+  })
+  globalThis.fetch = fetchMock as unknown as typeof fetch
+  const response = await createResponses(payload)
+  const body = await readResponseStream(response)
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  expect(body).toContain("Recovered")
+  expect(body).toContain("response.completed")
+  expect(body).not.toContain("response.failed")
+  expect(bodyToString(fetchMock.mock.calls[1][1].body)).toContain(
+    "Readable tool output",
+  )
+})
+
 test("detects encrypted-output failures across split CRLF boundaries", async () => {
   const payload = {
     model: "gpt-5.5",
@@ -366,7 +425,7 @@ test("detects encrypted-output failures across split CRLF boundaries", async () 
   expect(await response.text()).toContain("response.completed")
 })
 
-test("bounds encrypted-output inspection while a valid stream is idle", async () => {
+test("waits for output while an encrypted-output stream is idle", async () => {
   const payload = {
     model: "gpt-5.5",
     stream: true,
@@ -414,7 +473,7 @@ test("bounds encrypted-output inspection while a valid stream is idle", async ()
   const elapsed = performance.now() - startedAt
 
   expect(fetchMock).toHaveBeenCalledTimes(1)
-  expect(elapsed).toBeLessThan(250)
+  expect(elapsed).toBeGreaterThanOrEqual(300)
   expect(await response.text()).toContain("response.output_text.delta")
 })
 
@@ -453,5 +512,17 @@ test("does not retry after a Responses stream starts model output", async () => 
   const response = await createResponses(payload)
 
   expect(fetchMock).toHaveBeenCalledTimes(1)
-  expect(await response.text()).toBe(streamBody)
+  expect(await readResponseStream(response)).toBe(streamBody)
 })
+
+async function readResponseStream(response: Response): Promise<string> {
+  if (!response.body) throw new Error("Expected response body")
+  const reader = (response.body as ReadableStream<Uint8Array>).getReader()
+  const decoder = new TextDecoder()
+  let body = ""
+  while (true) {
+    const result = await reader.read()
+    if (result.done) return body + decoder.decode()
+    body += decoder.decode(result.value, { stream: true })
+  }
+}

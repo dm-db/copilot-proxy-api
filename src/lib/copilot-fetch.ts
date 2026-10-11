@@ -30,6 +30,7 @@ export async function copilotFetch(
 
   let lastError: unknown
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    throwIfAborted(init.signal)
     try {
       let response = await fetch(url, init)
       if (canRefreshAuth && isAuthFailure(response)) {
@@ -44,6 +45,7 @@ export async function copilotFetch(
         `Copilot ${requestLabel} returned ${response.status}; retrying (${attempt}/${attempts})`,
       )
     } catch (error) {
+      throwIfAborted(init.signal)
       if (error instanceof CopilotTokenRefreshError) {
         const cause = error.cause
         // Concurrent refresh callers each need a readable error response body.
@@ -66,12 +68,42 @@ export async function copilotFetch(
       )
     }
 
-    await sleep(retryDelayMs * attempt)
+    await waitForRetry(retryDelayMs * attempt, init.signal)
   }
 
   throw lastError instanceof Error ? lastError : (
       new Error("Copilot request failed")
     )
+}
+
+function throwIfAborted(signal?: AbortSignal | null): void {
+  signal?.throwIfAborted()
+}
+
+async function waitForRetry(
+  delayMs: number,
+  signal?: AbortSignal | null,
+): Promise<void> {
+  if (!signal) {
+    await sleep(delayMs)
+    return
+  }
+  signal.throwIfAborted()
+  await new Promise<void>((resolve, reject) => {
+    const abort = () => {
+      clearTimeout(timer)
+      reject(
+        signal.reason instanceof Error ?
+          signal.reason
+        : new DOMException("Request aborted", "AbortError"),
+      )
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", abort)
+      resolve()
+    }, delayMs)
+    signal.addEventListener("abort", abort, { once: true })
+  })
 }
 
 function isAuthFailure(response: Response): boolean {
@@ -90,6 +122,7 @@ async function retryWithRefreshedToken(
   try {
     token = await refreshCopilotToken(staleToken)
   } catch (error) {
+    init.signal?.throwIfAborted()
     consola.warn(
       `Copilot token refresh failed after ${requestLabel} returned ${response.status}: ${formatErrorMessage(error)}`,
     )
@@ -101,6 +134,7 @@ async function retryWithRefreshedToken(
   }
 
   const headers = new Headers(init.headers)
+  init.signal?.throwIfAborted()
   headers.set("Authorization", `Bearer ${token}`)
   init.headers = headers
   consola.warn(

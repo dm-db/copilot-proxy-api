@@ -5,6 +5,10 @@ import consola from "consola"
 import { setRequestLogMetadata } from "~/lib/request-log"
 import { state } from "~/lib/state"
 import { getTokenCount } from "~/lib/tokenizer"
+import {
+  countNativeTokens,
+  supportsNativeMessages,
+} from "~/services/copilot/create-native-messages"
 
 import { type AnthropicMessagesPayload } from "./anthropic-types"
 import { translateToOpenAI } from "./non-stream-translation"
@@ -37,6 +41,25 @@ export async function handleCountTokens(c: Context) {
         },
         404,
       )
+    }
+
+    if (supportsNativeMessages(selectedModel)) {
+      try {
+        const inputTokens = await countNativeTokens(
+          { ...anthropicPayload, model: selectedModel.id },
+          {
+            beta: anthropicBeta,
+            version: c.req.header("anthropic-version"),
+          },
+        )
+        consola.debug("Token count (Copilot):", inputTokens)
+        return c.json({ input_tokens: inputTokens })
+      } catch (error) {
+        consola.warn(
+          "Copilot count_tokens failed, using local estimate:",
+          error,
+        )
+      }
     }
 
     const tokenCount = await getTokenCount(openAIPayload, selectedModel)

@@ -1,4 +1,5 @@
 import type { Context } from "hono"
+import type { ContentfulStatusCode } from "hono/utils/http-status"
 
 import consola from "consola"
 import { streamSSE } from "hono/streaming"
@@ -23,6 +24,10 @@ import {
   type ChatCompletionsPayload,
   type ChatCompletionResponse,
 } from "~/services/copilot/create-chat-completions"
+import {
+  createNativeMessages,
+  supportsNativeMessages,
+} from "~/services/copilot/create-native-messages"
 import { createResponses } from "~/services/copilot/create-responses"
 
 import {
@@ -31,6 +36,7 @@ import {
 } from "./anthropic-types"
 import {
   preprocessAnthropicPayload,
+  translateModelName,
   translateToAnthropic,
   translateToOpenAI,
 } from "./non-stream-translation"
@@ -102,6 +108,24 @@ export async function handleCompletion(c: Context) {
 
   // Async preprocessing: PDF document block extraction, etc.
   const preprocessed = await preprocessAnthropicPayload(anthropicPayload)
+
+  const copilotModel = translateModelName(preprocessed.model)
+  if (
+    supportsNativeMessages(
+      state.models?.data.find((m) => m.id === copilotModel),
+    )
+  ) {
+    setRequestLogMetadata(c, {
+      model: copilotModel,
+      effort: preprocessed.output_config?.effort,
+    })
+    return await handleNativeMessages(
+      c,
+      { ...preprocessed, model: copilotModel },
+      requestId,
+    )
+  }
+
   const openAIPayload = translateToOpenAI(preprocessed)
   setRequestLogMetadata(c, {
     model: openAIPayload.model,
@@ -121,6 +145,34 @@ export async function handleCompletion(c: Context) {
   return await handleChatCompletions(c, openAIPayload, {
     clientModel,
     requestId,
+  })
+}
+
+/**
+ * Pass the Anthropic payload straight to Copilot's native /v1/messages and
+ * pipe the response (JSON or SSE) back unchanged. No translation and no
+ * fitContext trimming: Copilot enforces the real limit and returns an
+ * Anthropic-shaped "prompt is too long" error when it is exceeded.
+ */
+async function handleNativeMessages(
+  c: Context,
+  payload: AnthropicMessagesPayload,
+  requestId: string,
+) {
+  if (state.manualApprove) {
+    await awaitApproval()
+  }
+
+  consola.debug(`[${requestId}] Using native /v1/messages for ${payload.model}`)
+  const response = await createNativeMessages(payload, {
+    beta: c.req.header("anthropic-beta"),
+    version: c.req.header("anthropic-version"),
+  })
+
+  return c.body(response.body ?? "", response.status as ContentfulStatusCode, {
+    "content-type":
+      response.headers.get("content-type")
+      ?? (payload.stream ? "text/event-stream" : "application/json"),
   })
 }
 

@@ -293,7 +293,7 @@ function pickMatchingCopilotModel(
   return best.id
 }
 
-function translateModelName(model: string): string {
+export function translateModelName(model: string): string {
   // Claude Code uses Anthropic model IDs (e.g. claude-opus-4-5-20251101);
   // Copilot uses version-only names (e.g. claude-opus-4.7). Preserve the
   // version Claude Code requested instead of upgrading a family to latest.
@@ -531,8 +531,7 @@ function getPriorReasoning(
 
 function mapContent(
   content:
-    | string
-    | Array<AnthropicUserContentBlock | AnthropicAssistantContentBlock>,
+    string | Array<AnthropicUserContentBlock | AnthropicAssistantContentBlock>,
 ): string | Array<ContentPart> | null {
   if (typeof content === "string") {
     return content
